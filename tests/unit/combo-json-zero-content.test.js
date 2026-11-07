@@ -9,7 +9,13 @@
 //   R1b: JSON reasoning-only response → zero content → fallthrough
 //   R2:  JSON zero content on LAST candidate → error response (502), not empty 200
 //   R3:  JSON with real content → returned as-is, no fallthrough
-//   R4:  JSON content_filter finish with empty content → returned as-is (no-retry class)
+//   R4:  JSON content_filter finish with empty content → fallthrough (v2: the
+//        v1 no-retry exemption is removed — a safety stop on one provider says
+//        nothing about the next provider in a cross-provider combo)
+//   R5:  Raw Gemini-shaped body (promptFeedback block / candidates without
+//        text parts) → zero content → fallthrough
+//   R6:  2xx body that is not parseable JSON at all → zero content → fallthrough
+//        (v2: fail-closed; v1 treated parse errors as content)
 import { describe, it, expect, vi } from "vitest";
 
 // ── Keep I/O mocks off disk ──────────────────────────────────────────────────
@@ -99,12 +105,15 @@ describe("isZeroContentResponse", () => {
     });
   });
 
-  describe("OpenAI chat format — content_filter no-retry class", () => {
-    it("empty content + content_filter → NOT zero (no-retry class, return as-is)", () => {
-      expect(isZeroContentResponse(chatBody("", "content_filter"))).toBe(false);
+  describe("OpenAI chat format — content_filter is zero like any other empty (v2)", () => {
+    it("empty content + content_filter → IS zero (v1 exemption removed)", () => {
+      expect(isZeroContentResponse(chatBody("", "content_filter"))).toBe(true);
     });
-    it("null content + content_filter → NOT zero", () => {
-      expect(isZeroContentResponse(chatBody(null, "content_filter"))).toBe(false);
+    it("null content + content_filter → IS zero", () => {
+      expect(isZeroContentResponse(chatBody(null, "content_filter"))).toBe(true);
+    });
+    it("real content + content_filter → NOT zero (content wins)", () => {
+      expect(isZeroContentResponse(chatBody("partial answer", "content_filter"))).toBe(false);
     });
   });
 
@@ -129,16 +138,39 @@ describe("isZeroContentResponse", () => {
       const data = { content: [{ type: "text", text: "" }], stop_reason: "end_turn" };
       expect(isZeroContentResponse(data)).toBe(true);
     });
-    it("refusal stop_reason (content_filter class) → NOT zero", () => {
+    it("refusal stop_reason with no content → IS zero (v2, same rule as content_filter)", () => {
       const data = { content: [], stop_reason: "refusal" };
+      expect(isZeroContentResponse(data)).toBe(true);
+    });
+  });
+
+  describe("Gemini native format (raw passthrough bodies)", () => {
+    it("promptFeedback blockReason, no candidates → IS zero", () => {
+      const data = { promptFeedback: { blockReason: "SAFETY" } };
+      expect(isZeroContentResponse(data)).toBe(true);
+    });
+    it("empty candidates array → IS zero", () => {
+      expect(isZeroContentResponse({ candidates: [] })).toBe(true);
+    });
+    it("candidate with SAFETY finishReason and no parts → IS zero", () => {
+      const data = { candidates: [{ finishReason: "SAFETY", index: 0 }] };
+      expect(isZeroContentResponse(data)).toBe(true);
+    });
+    it("candidate with empty text part → IS zero", () => {
+      const data = { candidates: [{ content: { parts: [{ text: "" }] }, finishReason: "STOP" }] };
+      expect(isZeroContentResponse(data)).toBe(true);
+    });
+    it("candidate with real text part → NOT zero", () => {
+      const data = { candidates: [{ content: { parts: [{ text: "Halo!" }] }, finishReason: "STOP" }] };
       expect(isZeroContentResponse(data)).toBe(false);
     });
   });
 
   describe("edge cases", () => {
-    it("null → false", () => expect(isZeroContentResponse(null)).toBe(false));
+    it("null → false (not a response body this check can judge)", () => expect(isZeroContentResponse(null)).toBe(false));
     it("string → false", () => expect(isZeroContentResponse("text")).toBe(false));
-    it("empty object → false", () => expect(isZeroContentResponse({})).toBe(false));
+    it("empty object → IS zero (fail-closed: no recognisable usable content)", () => expect(isZeroContentResponse({})).toBe(true));
+    it("object with only usage/metadata → IS zero", () => expect(isZeroContentResponse({ id: "x", usage: { total_tokens: 5 } })).toBe(true));
   });
 });
 
@@ -242,16 +274,53 @@ describe("handleComboChat JSON zero-content integration", () => {
     expect(body.choices[0].message.content).toBe("I have content.");
   });
 
-  // R4: content_filter finish with empty content → returned as-is (no-retry class)
-  it("R4: content_filter + empty content → no-retry class, returned as-is (no fallthrough)", async () => {
+  // R4 (v2): content_filter finish with empty content → zero content → falls through.
+  // This is the production failure of 2026-11-07: Gemini SAFETY empties arrive
+  // mapped to finish_reason "content_filter" and v1 returned them as success.
+  it("R4: content_filter + empty content → falls through, returns next candidate", async () => {
     const filtered = jsonResp(chatCompletion("", "content_filter"));
-    const neverUsed = jsonResp(chatCompletion("Should never see this", "stop"));
+    const realAnswer = jsonResp(chatCompletion("DeepSeek answered instead", "stop"));
 
-    const { res, tried } = await comboWith([filtered, neverUsed]);
-    expect(tried).toEqual(["openai/m0"]);
-    expect(res.status).toBe(200);
+    const { res, tried } = await comboWith([filtered, realAnswer]);
+    expect(tried).toEqual(["openai/m0", "openai/m1"]);
     const body = await res.json();
-    expect(body.choices[0].finish_reason).toBe("content_filter");
+    expect(body.choices[0].message.content).toBe("DeepSeek answered instead");
+  });
+
+  // R4b: content_filter empty on the LAST candidate → error, not empty 200
+  it("R4b: single candidate content_filter + empty → error, not empty 200", async () => {
+    const filtered = jsonResp(chatCompletion("", "content_filter"));
+    const { res, tried } = await comboWith([filtered]);
+    expect(tried).toEqual(["openai/m0"]);
+    expect(res.status).not.toBe(200);
+    expect(res.status).toBeGreaterThanOrEqual(500);
+    const body = await res.json();
+    expect(body).toHaveProperty("error");
+  });
+
+  // R5: raw Gemini-shaped body (prompt-level block passthrough) → falls through
+  it("R5: promptFeedback blockReason body → zero content → falls through", async () => {
+    const blocked = jsonResp({ promptFeedback: { blockReason: "SAFETY" } });
+    const realAnswer = jsonResp(chatCompletion("Got it via fallback", "stop"));
+
+    const { res, tried } = await comboWith([blocked, realAnswer]);
+    expect(tried).toEqual(["openai/m0", "openai/m1"]);
+    const body = await res.json();
+    expect(body.choices[0].message.content).toBe("Got it via fallback");
+  });
+
+  // R6: 2xx body that is not parseable JSON → zero content → falls through (fail-closed)
+  it("R6: unparseable body → falls through, returns next candidate", async () => {
+    const garbage = new Response("this is not json at all", {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+    const realAnswer = jsonResp(chatCompletion("Parsed fine here", "stop"));
+
+    const { res, tried } = await comboWith([garbage, realAnswer]);
+    expect(tried).toEqual(["openai/m0", "openai/m1"]);
+    const body = await res.json();
+    expect(body.choices[0].message.content).toBe("Parsed fine here");
   });
 
   // Additional: single-candidate combo with zero content → error
