@@ -295,8 +295,16 @@ export function getComboModelsFromData(modelStr, combosData) {
 
 /**
  * Detect whether a 2xx JSON response contains zero usable content
- * (e.g. empty assistant message with in_progress/incomplete)
- * so combo fallback can continue to the next model.
+ * so combo fallback can continue to the next candidate instead of
+ * delivering an empty HTTP 200 to the caller.
+ *
+ * Rules (mirror the streaming peekStreamForContent / deltaHasClientContent semantics):
+ *   - Usable content = non-empty message content text OR tool_calls/function_call.
+ *   - reasoning_content alone does NOT count as usable content (aligns with the
+ *     streaming path: reasoning-only → think-then-abort → must fall through).
+ *   - finish_reason is IGNORED for the zero-content test, except for the
+ *     content_filter no-retry class: an empty content_filter response is a
+ *     legitimate safety block that will recur on every candidate — return it as-is.
  */
 export function isZeroContentResponse(data) {
   if (!data || typeof data !== "object") return false;
@@ -311,23 +319,30 @@ export function isZeroContentResponse(data) {
     const content = msg?.content;
     const hasContent = typeof content === "string" ? content.trim().length > 0 : (Array.isArray(content) && content.length > 0);
     const hasToolCalls = (Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0) || Boolean(msg?.function_call);
-    const hasReasoning = typeof msg?.reasoning_content === "string" ? msg.reasoning_content.trim().length > 0 : false;
 
+    if (hasContent || hasToolCalls) return false;
+
+    // No usable content. Exception: content_filter is a legitimate no-retry safety
+    // block — treat it as non-empty so it is returned as-is (matches streaming path).
     const finish = choice.finish_reason;
-    const isNormalFinish = finish === "stop" || finish === "length" || finish === "tool_calls" || finish === "function_call";
+    if (isNoRetryFinish(finish)) return false;
 
-    if (!hasContent && !hasToolCalls && !hasReasoning && (!isNormalFinish || finish === "in_progress" || finish === "incomplete")) {
-      return true;
-    }
+    return true;
   }
 
-  // Anthropic messages format
+  // Anthropic messages format: same principle — real text or tool_use = usable content;
+  // reasoning blocks alone do not count. "refusal" stop_reason = content_filter class.
   if (Array.isArray(data.content)) {
-    const hasContent = data.content.some((c) => (c.type === "text" && c.text?.trim().length > 0) || c.type === "tool_use");
+    const hasContent = data.content.some(
+      (c) => (c.type === "text" && c.text?.trim().length > 0) || c.type === "tool_use"
+    );
+    if (hasContent) return false;
+
+    // "refusal" is Anthropic's API-level safety block — no-retry class, return as-is.
     const stopReason = data.stop_reason;
-    if (!hasContent && (!stopReason || stopReason === "in_progress" || stopReason === "incomplete")) {
-      return true;
-    }
+    if (stopReason === "refusal") return false;
+
+    return true;
   }
 
   return false;
@@ -496,26 +511,31 @@ export async function handleComboChat({
         }
 
         if (!peeked) {
-          // Non-streaming (or non-SSE) response — not this peek's job. The zero-content
-          // JSON check still applies on a non-final seat.
-          const isLastModel = i === rotatedModels.length - 1;
-          if (!isLastModel) {
-            const contentType = result.headers?.get?.("content-type") || "";
-            if (contentType.includes("application/json")) {
-              try {
-                const peekBody = await result.clone().json();
-                if (isZeroContentResponse(peekBody)) {
-                  log.warn("COMBO", `Model ${modelStr} returned HTTP 200 with zero usable content, falling back to next model`);
-                  if (comboStrategy === "smart" && sessionId && modelStr === activeStickyModel) {
-                    clearStickyComboSession(comboName, sessionId);
-                  }
-                  lastError = "Zero usable content";
-                  lastStatus = 200;
-                  continue;
+          // Non-streaming (or non-SSE) response — not this peek's job, but the
+          // zero-content JSON check applies on EVERY seat (including the last).
+          // If the last candidate also returns empty, we fall through to the
+          // post-loop error path rather than delivering a zero-content HTTP 200.
+          const contentType = result.headers?.get?.("content-type") || "";
+          if (contentType.includes("application/json")) {
+            try {
+              const peekBody = await result.clone().json();
+              if (isZeroContentResponse(peekBody)) {
+                const isLastModel = i === rotatedModels.length - 1;
+                if (comboStrategy === "smart" && sessionId && modelStr === activeStickyModel) {
+                  clearStickyComboSession(comboName, sessionId);
                 }
-              } catch {
-                // Ignore JSON parse errors
+                lastError = "All candidates returned zero usable content";
+                lastStatus = 502;
+                if (isLastModel) {
+                  log.warn("COMBO", `Model ${modelStr} returned HTTP 200 with zero usable content — last candidate, returning error`);
+                  // Break out of loop to reach the post-loop error response (502).
+                  break;
+                }
+                log.warn("COMBO", `Model ${modelStr} returned HTTP 200 with zero usable content, falling back to next model`);
+                continue;
               }
+            } catch {
+              // Ignore JSON parse errors — treat as having content (fail-open)
             }
           }
 
