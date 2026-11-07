@@ -298,13 +298,26 @@ export function getComboModelsFromData(modelStr, combosData) {
  * so combo fallback can continue to the next candidate instead of
  * delivering an empty HTTP 200 to the caller.
  *
- * Rules (mirror the streaming peekStreamForContent / deltaHasClientContent semantics):
+ * Rules:
  *   - Usable content = non-empty message content text OR tool_calls/function_call.
  *   - reasoning_content alone does NOT count as usable content (aligns with the
  *     streaming path: reasoning-only → think-then-abort → must fall through).
- *   - finish_reason is IGNORED for the zero-content test, except for the
- *     content_filter no-retry class: an empty content_filter response is a
- *     legitimate safety block that will recur on every candidate — return it as-is.
+ *   - finish_reason is IGNORED entirely, including "content_filter" (and
+ *     Anthropic's "refusal"): in a cross-provider combo, a safety stop on one
+ *     candidate says nothing about the next candidate, which is a different
+ *     provider — so an empty safety-stopped response is zero content like any
+ *     other empty. (v1 exempted it, mirroring the streaming peek's no-retry
+ *     class; that exemption let Gemini SAFETY empties — mapped to
+ *     content_filter by the finish-reason translator — pass as success.)
+ *   - Gemini-native bodies are recognised too: a promptFeedback blockReason
+ *     or candidates without any text part = zero content. (The non-streaming
+ *     handler passes the raw Gemini body through when candidates[0] is
+ *     missing, so this shape really reaches the combo layer.)
+ *   - Any other JSON object with no recognisable usable content is zero
+ *     (fail-closed): a chat seat that yields no answer text has nothing the
+ *     caller can use.
+ *   - Non-object inputs (null, strings, numbers) are not response bodies
+ *     this check can judge → not zero.
  */
 export function isZeroContentResponse(data) {
   if (!data || typeof data !== "object") return false;
@@ -322,30 +335,33 @@ export function isZeroContentResponse(data) {
 
     if (hasContent || hasToolCalls) return false;
 
-    // No usable content. Exception: content_filter is a legitimate no-retry safety
-    // block — treat it as non-empty so it is returned as-is (matches streaming path).
-    const finish = choice.finish_reason;
-    if (isNoRetryFinish(finish)) return false;
-
     return true;
   }
 
   // Anthropic messages format: same principle — real text or tool_use = usable content;
-  // reasoning blocks alone do not count. "refusal" stop_reason = content_filter class.
+  // reasoning blocks alone do not count.
   if (Array.isArray(data.content)) {
     const hasContent = data.content.some(
       (c) => (c.type === "text" && c.text?.trim().length > 0) || c.type === "tool_use"
     );
     if (hasContent) return false;
 
-    // "refusal" is Anthropic's API-level safety block — no-retry class, return as-is.
-    const stopReason = data.stop_reason;
-    if (stopReason === "refusal") return false;
-
     return true;
   }
 
-  return false;
+  // Gemini native format (raw passthrough when no candidate was produced,
+  // e.g. a prompt-level safety block: { promptFeedback: { blockReason } })
+  if (data.promptFeedback || Array.isArray(data.candidates)) {
+    if (data.promptFeedback?.blockReason) return true;
+    const candidates = Array.isArray(data.candidates) ? data.candidates : [];
+    const hasText = candidates.some((cand) =>
+      (cand?.content?.parts || []).some((p) => typeof p?.text === "string" && p.text.trim().length > 0)
+    );
+    return !hasText;
+  }
+
+  // Any other JSON object: no recognisable usable content → zero.
+  return true;
 }
 
 /**
@@ -517,25 +533,30 @@ export async function handleComboChat({
           // post-loop error path rather than delivering a zero-content HTTP 200.
           const contentType = result.headers?.get?.("content-type") || "";
           if (contentType.includes("application/json")) {
+            // A body that fails JSON parsing entirely joins the zero-content
+            // path (fail-closed): a chat seat that returns no parseable answer
+            // has nothing the caller can use. (v1 failed open here.)
+            let peekBody = null;
+            let unparseable = false;
             try {
-              const peekBody = await result.clone().json();
-              if (isZeroContentResponse(peekBody)) {
-                const isLastModel = i === rotatedModels.length - 1;
-                if (comboStrategy === "smart" && sessionId && modelStr === activeStickyModel) {
-                  clearStickyComboSession(comboName, sessionId);
-                }
-                lastError = "All candidates returned zero usable content";
-                lastStatus = 502;
-                if (isLastModel) {
-                  log.warn("COMBO", `Model ${modelStr} returned HTTP 200 with zero usable content — last candidate, returning error`);
-                  // Break out of loop to reach the post-loop error response (502).
-                  break;
-                }
-                log.warn("COMBO", `Model ${modelStr} returned HTTP 200 with zero usable content, falling back to next model`);
-                continue;
-              }
+              peekBody = await result.clone().json();
             } catch {
-              // Ignore JSON parse errors — treat as having content (fail-open)
+              unparseable = true;
+            }
+            if (unparseable || isZeroContentResponse(peekBody)) {
+              const isLastModel = i === rotatedModels.length - 1;
+              if (comboStrategy === "smart" && sessionId && modelStr === activeStickyModel) {
+                clearStickyComboSession(comboName, sessionId);
+              }
+              lastError = "All candidates returned zero usable content";
+              lastStatus = 502;
+              if (isLastModel) {
+                log.warn("COMBO", `Model ${modelStr} returned HTTP 200 with zero usable content — last candidate, returning error`);
+                // Break out of loop to reach the post-loop error response (502).
+                break;
+              }
+              log.warn("COMBO", `Model ${modelStr} returned HTTP 200 with zero usable content, falling back to next model`);
+              continue;
             }
           }
 
