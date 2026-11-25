@@ -2,6 +2,11 @@ name: Build and Push Docker Image
 
 on:
   push:
+    branches:
+      # Fork: build this branch on push (upstream only builds on tags).
+      # The prepare job derives the release tag from package.json for
+      # non-tag pushes, so a branch push builds the package.json version.
+      - "fix/combo-empty-fallback"
     tags:
       - "v*"
   workflow_dispatch:
@@ -61,7 +66,12 @@ jobs:
           const fs = require("fs");
           const { execFileSync } = require("child_process");
 
-          const tag = process.env.RELEASE_TAG || "";
+          // Fork: a branch push has no semver tag (ref_name is the branch
+          // name), so derive the release tag from package.json instead.
+          let tag = process.env.RELEASE_TAG || "";
+          if (!/^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(tag)) {
+            tag = `v${require("./package.json").version}`;
+          }
           const match = /^v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$/.exec(tag);
 
           if (tag.includes("+")) {
@@ -310,6 +320,23 @@ jobs:
             printf '%s\n' "$actual" >&2
             exit 1
           fi
+
+      - name: Tag combo-fix alias
+        env:
+          GHCR_IMAGE: ${{ env.GHCR_IMAGE }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "${GHCR_IMAGE}:v${VERSION}-combo-fix" \
+            "${GHCR_IMAGE}:${VERSION}"
+
+          docker buildx imagetools inspect "${GHCR_IMAGE}:v${VERSION}-combo-fix" | tee "$RUNNER_TEMP/combo-fix-manifest.txt"
+
+          {
+            echo "### Combo-fix alias"
+            echo "- GHCR: \`${GHCR_IMAGE}:v${VERSION}-combo-fix\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Smoke-test resolved version manifest
         env:
